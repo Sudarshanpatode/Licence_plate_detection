@@ -1,0 +1,195 @@
+# ================= INSTALL ALL REQUIREMENTS =================
+!pip install ultralytics roboflow easyocr opencv-python-headless torch torchvision numpy matplotlib pillow -q
+
+
+# ================= IMPORTS =================
+# YOLOv8
+from ultralytics import YOLO
+
+# Dataset
+from roboflow import Roboflow
+
+# OCR
+import easyocr
+
+# Deep Learning
+import torch
+
+# Image processing
+import cv2
+import numpy as np
+from PIL import Image
+
+# Visualization
+import matplotlib.pyplot as plt
+
+# Utilities
+import os
+import glob
+import random
+
+# Video utilities
+from collections import defaultdict, Counter
+import time
+
+
+# ================= DATASET DOWNLOAD =================
+
+
+from roboflow import Roboflow
+rf = Roboflow(api_key="ZQivRMJ4H5fZvWknIUqc")
+project = rf.workspace("yolox-qcftu").project("indian-number-plate-keeo5")
+version = project.version(2)
+
+dataset = version.download("yolov8") # Added this line as it was missing after the dataset variable was removed in previous step.
+
+data_yaml = dataset.location + "/data.yaml"
+
+
+# ================= TRAIN MODEL =================
+model = YOLO("yolov8n.pt")
+
+model.train(
+    data=data_yaml,
+    epochs=50,
+    imgsz=640,
+    batch=16,
+    name="license_plate_detector"
+)
+
+
+# ================= LOAD BEST MODEL =================
+model = YOLO("runs/detect/license_plate_detector/weights/best.pt")
+
+
+# ================= OCR INITIALIZATION =================
+reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+
+
+# ================= INDIAN PLATE CORRECTION =================
+def correct_indian_plate(text):
+    text = text.upper().replace(" ", "").replace("-", "")
+
+    if len(text) != 10:
+        return None
+
+    num_to_alpha = {'0': 'O', '1': 'I', '5': 'S', '8': 'B'}
+    alpha_to_num = {'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8'}
+
+    corrected = []
+
+    for i, ch in enumerate(text):
+        # LETTER positions (LL _ _ LL _ _ _ _)
+        if i in [0, 1, 4, 5]:
+            if ch.isdigit() and ch in num_to_alpha:
+                corrected.append(num_to_alpha[ch])
+            elif ch.isalpha():
+                corrected.append(ch)
+            else:
+                return None
+
+        # NUMBER positions (_ _ NN _ _ NNNN)
+        else:
+            if ch.isalpha() and ch in alpha_to_num:
+                corrected.append(alpha_to_num[ch])
+            elif ch.isdigit():
+                corrected.append(ch)
+            else:
+                return None
+
+    return "".join(corrected)
+
+
+# ================= PREPROCESSING =================
+def preprocess(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    return thresh
+
+
+# ================= OCR + CORRECTION =================
+def read_plate(plate_img):
+    for img in [plate_img, preprocess(plate_img)]:
+        results = reader.readtext(img)
+        for (_, text, conf) in results:
+            if len(text) >= 6:
+                corrected = correct_indian_plate(text)
+                if corrected:
+                    return corrected, conf
+    return None, None
+
+
+# ================= IMAGE DETECTION =================
+def detect_and_read(image_path):
+    img = cv2.imread(image_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    results = model(img)[0]
+
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        plate = img[y1:y2, x1:x2]
+        text, conf = read_plate(plate)
+
+        cv2.rectangle(img_rgb, (x1,y1), (x2,y2), (0,255,0), 2)
+
+        label = text if text else "Unreadable"
+        cv2.putText(img_rgb, label, (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        print("Detected:", text, "| OCR confidence:", conf)
+
+    plt.imshow(img_rgb)
+    plt.axis("off")
+    plt.show()
+
+
+# ================= VIDEO PROCESSING =================
+def process_video(video_path, output_path="output.mp4"):
+    cap = cv2.VideoCapture(video_path)
+
+    width = int(cap.get(3))
+    height = int(cap.get(4))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    out = cv2.VideoWriter(output_path,
+                          cv2.VideoWriter_fourcc(*'mp4v'),
+                          fps, (width, height))
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model(frame)[0]
+
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            plate = frame[y1:y2, x1:x2]
+            text, conf = read_plate(plate)
+
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+
+            label = text if text else "Unreadable"
+            cv2.putText(frame, label, (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+            if text:
+                print(f"Detected: {text} | OCR confidence: {conf}")
+
+        out.write(frame)
+
+    cap.release()
+    out.release()
+
+
+# ================= RUN =================
+detect_and_read("images.jpg")   # test image
+process_video("video.mp4")      # test video
